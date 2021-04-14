@@ -13,4 +13,8 @@ include_directories(./)
 
 add_executable(service service.c)
 
-target_link_libraries(service ibverbs)
+add_executable(double_service double_service.c)
+
+target_link_libraries(service ibverbs pthread)
+
+target_link_libraries(double_service ibverbs pthread)
