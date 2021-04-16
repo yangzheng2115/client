@@ -11,9 +11,9 @@ set(CMAKE_CXX_FLAGS "-fpermissive ${CMAKE_CXX_FLAGS}")
 
 include_directories(./)
 
-add_executable(service service.c)
+add_executable(service service.cpp)
 
-add_executable(double_service double_service.c)
+add_executable(double_service double_service.cpp)
 
 target_link_libraries(service ibverbs pthread)
 
