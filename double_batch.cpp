@@ -1,7 +1,3 @@
-//
-// Created by yangzheng on 2021/4/15.
-//
-
 /*
 * BUILD COMMAND:
 * gcc -Wall -I/usr/local/ofed/include -O2 -o RDMA_RC_example -L/usr/local/ofed/lib64 -L/usr/local/ofed/lib -
@@ -32,6 +28,7 @@ libverbs RDMA_RC_example.c
 #include <iostream>
 #include <vector>
 #include <thread>
+#include <time.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
@@ -102,6 +99,8 @@ long *timelist;
 
 int numa_flag = 0;
 
+int batch =16;
+
 static int resources_destroy(struct resources *res);
 
 static void resources_init(struct resources *res);
@@ -117,6 +116,10 @@ static int post_receive(struct resources *res);
 static int post_send(struct resources *res, int opcode);
 
 static int poll_completion(struct resources *res);
+
+static int poll_completion_batch(struct resources *res,int num);
+
+static int post_receive_batch(struct resources *res,int receive_batch);
 
 void pin_to_core(size_t core) {
     cpu_set_t cpuset;
@@ -306,6 +309,49 @@ static int poll_completion(struct resources *res) {
     return rc;
 }
 
+static int poll_completion_batch(struct resources *res,int num) {
+    struct ibv_wc wc,wcl[64];
+    unsigned long start_time_msec;
+    unsigned long cur_time_msec;
+    struct timeval cur_time;
+    int poll_result;
+    int rc = 0;
+    /* poll the completion for a while before giving up of doing it .. */
+    gettimeofday(&cur_time, NULL);
+    start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    int sum =0;
+    do {
+        poll_result = ibv_poll_cq(res->cq, num - sum, &wcl[sum]);
+        if(poll_result > 0)
+            sum += poll_result;
+        gettimeofday(&cur_time, NULL);
+        cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    } while ((sum != num) &&((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    //cout<<"sum :"<<sum<<endl;
+    if (poll_result < 0) {
+        /* poll CQ failed */
+        fprintf(stderr, "poll CQ failed\n");
+        rc = 1;
+    } else if (poll_result == 0) { /* the CQ is empty */
+        fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
+        rc = 1;
+    } else {
+        //cout<<"poll result: "<<poll_result<<endl;
+        if(sum != num)
+            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wcl[poll_result -1 ].status,
+                    wcl[poll_result -1 ].vendor_err);
+        /* CQE found */
+        //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+        /* check the completion status (here we don't care about the completion opcode */
+        if (wcl[poll_result -1 ].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wcl[poll_result -1 ].status,
+                    wcl[poll_result -1 ].vendor_err);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
 /******************************************************************************
 * Function: post_send
 *
@@ -323,8 +369,8 @@ static int poll_completion(struct resources *res) {
 * This function will create and post a send work request
 ******************************************************************************/
 static int post_send(struct resources *res, int opcode) {
-    struct ibv_send_wr sr;
-    struct ibv_sge sge;
+    struct ibv_send_wr sr,srl[64];
+    struct ibv_sge sge,sgl[64];
     struct ibv_send_wr *bad_wr = NULL;
     int rc;
     /* prepare the scatter/gather entry */
@@ -338,15 +384,34 @@ static int post_send(struct resources *res, int opcode) {
     sr.wr_id = 0;
     sr.sg_list = &sge;
     sr.num_sge = 1;
-    sr.opcode = opcode;
+    sr.opcode = static_cast<ibv_wr_opcode>(opcode);
     sr.send_flags = IBV_SEND_SIGNALED;
     //sr.send_flags|= IBV_SEND_INLINE;
     if (opcode != IBV_WR_SEND) {
         sr.wr.rdma.remote_addr = res->remote_props.addr;
         sr.wr.rdma.rkey = res->remote_props.rkey;
     }
+    //int batch = 4;
+    for(int i =0;i< batch;i++){
+        sgl[i].addr = (uintptr_t) res->buf;
+        sgl[i].length = MSG_SIZE;
+        sgl[i].lkey = res->mr->lkey;
+        /* prepare the send work request */
+        srl[i].wr_id = 0;
+        srl[i].sg_list = &sgl[i];
+        srl[i].num_sge = 1;
+        srl[i].opcode = static_cast<ibv_wr_opcode>(opcode);
+        if(i != batch -1){
+            srl[i].next = &srl[i+1];
+            srl[i].send_flags = 0;
+        }else{
+            srl[i].next = NULL;
+            srl[i].send_flags = IBV_SEND_SIGNALED;
+        }
+        srl[i].send_flags |= IBV_SEND_INLINE;
+    }
     /* there is a Receive Request in the responder side, so we won't get any into RNR flow */
-    rc = ibv_post_send(res->qp, &sr, &bad_wr);
+    rc = ibv_post_send(res->qp, &srl[0], &bad_wr);
     if (rc)
         fprintf(stderr, "failed to post SR\n");
     else {
@@ -407,6 +472,35 @@ static int post_receive(struct resources *res) {
     //    fprintf(stdout, "Receive Request was posted\n");
     return rc;
 }
+
+static int post_receive_batch(struct resources *res,int receive_batch) {
+    struct ibv_recv_wr rr,rrl[64];
+    struct ibv_sge sge,sgl[64];
+    struct ibv_recv_wr *bad_wr;
+    int rc;
+    /* prepare the scatter/gather entry */
+    for(int i=0;i<receive_batch;i++) {
+        sgl[i].addr = (uintptr_t) (res->buf + MSG_SIZE * 20);
+        sgl[i].length = MSG_SIZE;
+        sgl[i].lkey = res->mr->lkey;
+        /* prepare the receive work request */
+        if(i == receive_batch -1)
+            rrl[i].next = NULL;
+        else
+            rrl[i].next = &rrl[i+1];
+        rrl[i].wr_id = 0;
+        rrl[i].sg_list = &sgl[i];
+        rrl[i].num_sge = 1;
+    }
+    /* post the Receive Request to the RQ */
+    rc = ibv_post_recv(res->qp, &rrl[0], &bad_wr);
+    if (rc)
+        fprintf(stderr, "failed to post RR\n");
+    //else
+    //    fprintf(stdout, "Receive Request was posted\n");
+    return rc;
+}
+
 
 /******************************************************************************
 * Function: resources_init
@@ -532,7 +626,7 @@ static int resources_create(struct resources *res, struct config_t *config1) {
         goto resources_create_exit;
     }
     /* each side will send only one WR, so Completion Queue with 1 entry is enough */
-    cq_size = 1000;
+    cq_size = 1100;
     res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, NULL, 0);
     if (!res->cq) {
         fprintf(stderr, "failed to create CQ with %u entries\n", cq_size);
@@ -975,15 +1069,24 @@ void data_send(int id) {
         //printf("%d\n",num);
         //sleep(1);
         /* in both sides we expect to get a completion */
-        if (poll_completion(&res)) {
+        if (poll_completion_batch(&res,batch)) {
             fprintf(stderr, "poll completion failed\n");
             return;
         }
-        int we = post_receive(&res);
-        if (num == 100000) {
+        int we = post_receive_batch(&res,batch);
+        if (post_send(&res, IBV_WR_SEND)) {
+            fprintf(stderr, "failed to post sr\n");
+            return;
+        }
+        if (poll_completion_batch(&res,batch)) {
+            fprintf(stderr, "poll completion failed\n");
+            return;
+        }
+        //return;
+        if (num == 10000) {
             gettimeofday(&cur_time, NULL);
             cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-            cout << cur_time_msec - start_time_msec << endl;
+            //cout << cur_time_msec - start_time_msec << endl;
             timelist[tid] = cur_time_msec - start_time_msec;
             printf("success\n");
             if (resources_destroy(&res)) {
@@ -1017,7 +1120,7 @@ void data_send(int id) {
 int main(int argc, char *argv[]) {
     struct resources res;
     int rc = 1;
-    int thread_num =1;
+    int thread_num = 1;
     char temp_char;
     /* parse the command line parameters */
     while (1) {
@@ -1029,9 +1132,10 @@ int main(int argc, char *argv[]) {
                 {.name = "gid-idx", .has_arg = 1, .flag = NULL, .val = 'g'},
                 {.name = "thread-num", .has_arg = 1, .flag = NULL, .val = 't'},
                 {.name = "numa-flag", .has_arg = 1, .flag = NULL, .val = 'n'},
+                {.name = "batch", .has_arg = 1, .flag = NULL, .val = 'b'},
                 {.name = NULL, .has_arg = 0, .flag = NULL, .val = '\0'}
         };
-        c = getopt_long(argc, argv, "p:d:i:g:t:n:", long_options, NULL);
+        c = getopt_long(argc, argv, "p:d:i:g:t:n:b:", long_options, NULL);
         if (c == -1)
             break;
         switch (c) {
@@ -1061,6 +1165,9 @@ int main(int argc, char *argv[]) {
             case 'n':
                 numa_flag = strtoul(optarg, NULL, 0);
                 break;
+            case 'b':
+                batch = strtoul(optarg, NULL, 0);
+                break;
             default:
                 usage(argv[0]);
                 return 1;
@@ -1077,9 +1184,9 @@ int main(int argc, char *argv[]) {
     }
     /* print the used parameters for info*/
     print_config();
+    resources_init(&res);
     timelist = (long *) calloc(thread_num, sizeof(long));
     /* init all of the resources, so cleanup will be easy */
-    resources_init(&res);
     int num = 0;
     vector<thread> threads;
     for (int i = 0; i < thread_num; i++)
@@ -1194,4 +1301,6 @@ Note that the server has no idea these events have occured */
     fprintf(stdout, "\ntest result is %d\n", rc);
     return rc;
 }
+
+
 

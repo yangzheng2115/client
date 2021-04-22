@@ -1,4 +1,8 @@
 //
+// Created by yangzheng on 2021/4/20.
+//
+
+//
 // Created by yangzheng on 2021/4/15.
 //
 
@@ -117,6 +121,8 @@ static int post_receive(struct resources *res);
 static int post_send(struct resources *res, int opcode);
 
 static int poll_completion(struct resources *res);
+
+static int post_receive_batch(struct resources *res,int receive_batch);
 
 void pin_to_core(size_t core) {
     cpu_set_t cpuset;
@@ -272,7 +278,7 @@ End of socket operations
 *
 ******************************************************************************/
 static int poll_completion(struct resources *res) {
-    struct ibv_wc wc;
+    struct ibv_wc wc,wcl[64];
     unsigned long start_time_msec;
     unsigned long cur_time_msec;
     struct timeval cur_time;
@@ -281,11 +287,16 @@ static int poll_completion(struct resources *res) {
     /* poll the completion for a while before giving up of doing it .. */
     gettimeofday(&cur_time, NULL);
     start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    int sum =0;
     do {
-        poll_result = ibv_poll_cq(res->cq, 1, &wc);
+        poll_result = ibv_poll_cq(res->cq, 4, wcl);
+        sum += poll_result;
+        if(sum == 4)
+            break;
         gettimeofday(&cur_time, NULL);
         cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-    } while ((poll_result == 0) && ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    } while (/*(poll_result == 0) &&*/ ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    cout<<"sum :"<<sum<<endl;
     if (poll_result < 0) {
         /* poll CQ failed */
         fprintf(stderr, "poll CQ failed\n");
@@ -294,17 +305,59 @@ static int poll_completion(struct resources *res) {
         fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
         rc = 1;
     } else {
+         cout<<"poll result: "<<poll_result<<endl;
         /* CQE found */
         //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
         /* check the completion status (here we don't care about the completion opcode */
-        if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc.status,
-                    wc.vendor_err);
+        if (wcl[sum -1 ].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wcl[sum -1 ].status,
+                    wcl[sum -1 ].vendor_err);
             rc = 1;
         }
     }
     return rc;
 }
+
+static int poll_completion_batch(struct resources *res,int num) {
+    struct ibv_wc wc,wcl[64];
+    unsigned long start_time_msec;
+    unsigned long cur_time_msec;
+    struct timeval cur_time;
+    int poll_result;
+    int rc = 0;
+    /* poll the completion for a while before giving up of doing it .. */
+    gettimeofday(&cur_time, NULL);
+    start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    int sum =0;
+    do {
+        poll_result = ibv_poll_cq(res->cq, num, wcl);
+        if(poll_result > 0)
+        sum += poll_result;
+        gettimeofday(&cur_time, NULL);
+        cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    } while ((sum != num) &&((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    //cout<<"sum :"<<sum<<endl;
+    if (poll_result < 0) {
+        /* poll CQ failed */
+        fprintf(stderr, "poll CQ failed\n");
+        rc = 1;
+    } else if (poll_result == 0) { /* the CQ is empty */
+        fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
+        rc = 1;
+    } else {
+        cout<<"poll result: "<<poll_result<<endl;
+        /* CQE found */
+        //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+        /* check the completion status (here we don't care about the completion opcode */
+        if (wcl[poll_result -1 ].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wcl[poll_result -1 ].status,
+                    wcl[poll_result -1 ].vendor_err);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
 
 /******************************************************************************
 * Function: post_send
@@ -401,6 +454,34 @@ static int post_receive(struct resources *res) {
     rr.num_sge = 1;
     /* post the Receive Request to the RQ */
     rc = ibv_post_recv(res->qp, &rr, &bad_wr);
+    if (rc)
+        fprintf(stderr, "failed to post RR\n");
+    //else
+    //    fprintf(stdout, "Receive Request was posted\n");
+    return rc;
+}
+
+static int post_receive_batch(struct resources *res,int receive_batch) {
+    struct ibv_recv_wr rr,rrl[64];
+    struct ibv_sge sge,sgl[64];
+    struct ibv_recv_wr *bad_wr;
+    int rc;
+    /* prepare the scatter/gather entry */
+    for(int i=0;i<receive_batch;i++) {
+        sgl[i].addr = (uintptr_t) (res->buf + MSG_SIZE * 20);
+        sgl[i].length = MSG_SIZE;
+        sgl[i].lkey = res->mr->lkey;
+        /* prepare the receive work request */
+        if(i == receive_batch -1)
+            rrl[i].next = NULL;
+        else
+            rrl[i].next = &rrl[i+1];
+        rrl[i].wr_id = 0;
+        rrl[i].sg_list = &sgl[i];
+        rrl[i].num_sge = 1;
+    }
+    /* post the Receive Request to the RQ */
+    rc = ibv_post_recv(res->qp, &rrl[0], &bad_wr);
     if (rc)
         fprintf(stderr, "failed to post RR\n");
     //else
@@ -803,12 +884,17 @@ static int connect_qp(struct resources *res, struct config_t *config1) {
     }
     /* let the client post RR to be prepared for incoming messages */
     if (config1->server_name) {
-        for (int i = 0; i < 1000; i++) {
+        /*for (int i = 0; i < 10; i++) {
             rc = post_receive(res);
             if (rc) {
                 fprintf(stderr, "failed to post RR\n");
                 goto connect_qp_exit;
             }
+        }*/
+        rc = post_receive_batch(res,10);
+        if (rc) {
+            fprintf(stderr, "failed to post RR\n");
+            goto connect_qp_exit;
         }
     }
     /* modify the QP to RTR */
@@ -979,6 +1065,8 @@ void data_send(int id) {
             fprintf(stderr, "poll completion failed\n");
             return;
         }
+        cout<<"success"<<endl;
+        return;
         int we = post_receive(&res);
         if (num == 100000) {
             gettimeofday(&cur_time, NULL);

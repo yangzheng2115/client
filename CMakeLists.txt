@@ -13,8 +13,16 @@ include_directories(./)
 
 add_executable(service service.cpp)
 
+add_executable(service_batch service_batch.cpp)
+
 add_executable(double_service double_service.cpp)
+
+add_executable(double_batch double_batch.cpp)
 
 target_link_libraries(service ibverbs pthread)
 
 target_link_libraries(double_service ibverbs pthread)
+
+target_link_libraries(service_batch ibverbs pthread)
+
+target_link_libraries(double_batch ibverbs pthread)
